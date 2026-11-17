@@ -839,12 +839,13 @@ describe('durable run terminal reconciliation', () => {
 
   it.each([
     { dropReason: 'network_error', requestsPerDelivery: 2 },
-    { dropReason: 'payload_too_large', requestsPerDelivery: 0 },
-  ])('stops replaying a $dropReason Langfuse delivery once its failures are exhausted', async ({
+    { dropReason: 'network_error', requestsPerDelivery: 0 },
+    { dropReason: 'langfuse_4xx', requestsPerDelivery: 2 },
+  ])('stops replaying a $dropReason Langfuse delivery ($requestsPerDelivery requests a pass) once its failures are exhausted', async ({
     dropReason,
     requestsPerDelivery,
   }) => {
-    const runId = `run-langfuse-${dropReason}`;
+    const runId = `run-langfuse-${dropReason}-${requestsPerDelivery}`;
     const runDir = path.join(tmpDir, runId);
     const eventsPath = path.join(runDir, 'events.jsonl');
     fs.mkdirSync(runDir, { recursive: true });
@@ -861,7 +862,7 @@ describe('durable run terminal reconciliation', () => {
       terminalAt: 2_000,
       telemetryDelivery: {
         version: 1,
-        idempotencyKey: `od-run-telemetry-v1-${dropReason}`,
+        idempotencyKey: `od-run-telemetry-v1-${runId}`,
         status: 'failed',
         attemptCount: requestsPerDelivery,
         crashWindow: false,
@@ -909,12 +910,59 @@ describe('durable run terminal reconciliation', () => {
     expect(readFile).not.toHaveBeenCalledWith(eventsPath, 'utf8');
     const state = JSON.parse(fs.readFileSync(path.join(runDir, 'state.json'), 'utf8'));
     expect(state.telemetryDelivery).toMatchObject({
-      idempotencyKey: `od-run-telemetry-v1-${dropReason}`,
+      idempotencyKey: `od-run-telemetry-v1-${runId}`,
       status: 'dropped',
       crashWindow: false,
       dropReason,
     });
     expect(state.telemetryDelivery.finalizedAt).toEqual(expect.any(Number));
+    expect(state.langfuseCompletedAt).toBe(state.telemetryDelivery.finalizedAt);
+  });
+
+  it('drops a permanently rejected delivery at boot without replaying it', async () => {
+    const runId = 'run-langfuse-relay-413';
+    const runDir = path.join(tmpDir, runId);
+    const eventsPath = path.join(runDir, 'events.jsonl');
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, 'state.json'), JSON.stringify({
+      schemaVersion: 1,
+      id: runId,
+      projectId: 'p1',
+      conversationId: 'c1',
+      assistantMessageId: 'm1',
+      agentId: 'claude',
+      status: 'succeeded',
+      createdAt: 1_000,
+      updatedAt: 2_000,
+      terminalAt: 2_000,
+      telemetryDelivery: {
+        version: 1,
+        idempotencyKey: 'od-run-telemetry-v1-relay-413',
+        status: 'failed',
+        attemptCount: 1,
+        crashWindow: false,
+        startedAt: 2_000,
+        dropReason: 'relay_413',
+      },
+    }));
+    fs.writeFileSync(eventsPath, '');
+    const reportLangfuse = vi.fn();
+    const readFile = vi.spyOn(fs, 'readFileSync');
+
+    const boot = await reconcileDurableRunTerminals({
+      analytics: { capture: vi.fn() },
+      appVersion: '0.27.1',
+      db,
+      reportLangfuse,
+      runsLogDir: tmpDir,
+    });
+
+    expect(boot.langfuseReplayed).toBe(0);
+    expect(reportLangfuse).not.toHaveBeenCalled();
+    expect(readFile).not.toHaveBeenCalledWith(eventsPath, 'utf8');
+    readFile.mockRestore();
+    const state = JSON.parse(fs.readFileSync(path.join(runDir, 'state.json'), 'utf8'));
+    expect(state.telemetryDelivery).toMatchObject({ status: 'dropped', dropReason: 'relay_413' });
     expect(state.langfuseCompletedAt).toBe(state.telemetryDelivery.finalizedAt);
   });
 

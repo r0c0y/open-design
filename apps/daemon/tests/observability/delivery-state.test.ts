@@ -6,6 +6,7 @@ import {
   finalizeRunTelemetryDelivery,
   isRunTelemetryDeliveryCrashWindow,
   MAX_RUN_TELEMETRY_DELIVERY_FAILURES,
+  PERMANENT_TELEMETRY_DROP_REASONS,
   recordRunTelemetryDeliveryAttempt,
   runTelemetryDeliveryIdempotencyKey,
   runTelemetryDeliveryReportedStatus,
@@ -167,7 +168,6 @@ describe('run telemetry delivery state', () => {
     let state: RunTelemetryDeliveryStateV1 | undefined;
     for (let pass = 1; pass <= MAX_RUN_TELEMETRY_DELIVERY_FAILURES; pass += 1) {
       state = failDelivery(state, pass * 1_000, {
-        langfuse_drop_reason: 'payload_too_large',
         langfuse_attempt_count: 0,
       });
     }
@@ -176,7 +176,49 @@ describe('run telemetry delivery state', () => {
       status: 'dropped',
       attemptCount: 0,
       failureCount: MAX_RUN_TELEMETRY_DELIVERY_FAILURES,
-      dropReason: 'payload_too_large',
+      dropReason: 'network_error',
+    });
+  });
+
+  it.each([...PERMANENT_TELEMETRY_DROP_REASONS])(
+    'drops a delivery at its first failure when the sink rejected the payload (%s)',
+    (dropReason) => {
+      const dropped = failDelivery(undefined, 1_000, { langfuse_drop_reason: dropReason });
+
+      expect(dropped).toMatchObject({
+        status: 'dropped',
+        failureCount: 1,
+        crashWindow: false,
+        dropReason,
+        finalizedAt: 1_001,
+      });
+      expect(beginRunTelemetryDelivery(dropped, 'run-1', 2_000)).toBe(dropped);
+    },
+  );
+
+  it('keeps retrying langfuse_4xx, which the direct Langfuse sink also reports for a 429', () => {
+    const state = failDelivery(undefined, 1_000, { langfuse_drop_reason: 'langfuse_4xx' });
+
+    expect(state).toMatchObject({ status: 'failed', failureCount: 1, dropReason: 'langfuse_4xx' });
+    expect(state).not.toHaveProperty('finalizedAt');
+  });
+
+  it('drops a failed state written before this change when its reason is permanent', () => {
+    const legacy: RunTelemetryDeliveryStateV1 = {
+      version: 1,
+      idempotencyKey: 'od-run-telemetry-v1-legacy',
+      status: 'failed',
+      attemptCount: 2,
+      crashWindow: false,
+      startedAt: 1_000,
+      dropReason: 'relay_413',
+    };
+
+    expect(dropExhaustedRunTelemetryDelivery(legacy, 2_000)).toMatchObject({
+      status: 'dropped',
+      failureCount: 1,
+      dropReason: 'relay_413',
+      finalizedAt: 2_000,
     });
   });
 
